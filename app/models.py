@@ -1,4 +1,4 @@
-"""ORM 模型：批次、生产单、投料明细、幂等记录。"""
+"""ORM 模型：批次、库位余额、生产单、投料明细、调拨单、幂等记录。"""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -24,6 +24,10 @@ from .db import Base
 # Numeric 精度：整数 18 位、小数 4 位，满足食品厂计量场景
 QTY = Numeric(18, 4)
 
+# 默认库位编号：既有批次余量与新登记批次/产出/子批次的数量都先归入该库位。
+# 默认库位不参与任何特殊排序——未指定库位的扣减一律按库位编号升序进行。
+DEFAULT_LOCATION_NO = "DEFAULT"
+
 
 class Batch(Base):
     """批次：既可能是原料批次，也可能是生产产出批次。"""
@@ -46,11 +50,37 @@ class Batch(Base):
     inputs: Mapped[list["ProductionInput"]] = relationship(
         back_populates="source_batch", foreign_keys="ProductionInput.source_no"
     )
+    locations: Mapped[list["BatchLocation"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         CheckConstraint("initial_qty > 0", name="ck_batch_initial_qty_positive"),
         CheckConstraint("remaining_qty >= 0", name="ck_batch_remaining_non_negative"),
         CheckConstraint("remaining_qty <= initial_qty", name="ck_batch_remaining_within"),
+    )
+
+
+class BatchLocation(Base):
+    """批次在某个库位上的余量（两层库存核算的库位层）。
+
+    不变式：同一批次所有库位行 qty 之和恒等于 batches.remaining_qty，
+    两层余额的每一次变动都在同一事务内完成。库位行一旦建立即保留
+    （扣到 0 也保留，便于审计该批次曾存放于哪些库位）。
+    """
+
+    __tablename__ = "batch_locations"
+
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), primary_key=True
+    )
+    location_no: Mapped[str] = mapped_column(String(64), primary_key=True)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+
+    batch: Mapped[Batch] = relationship(back_populates="locations")
+
+    __table_args__ = (
+        CheckConstraint("qty >= 0", name="ck_batch_location_qty_non_negative"),
     )
 
 
@@ -105,11 +135,39 @@ class ProductionInput(Base):
     source_batch: Mapped[Batch] = relationship(
         back_populates="inputs", foreign_keys=[source_no]
     )
+    location_parts: Mapped[list["ProductionInputLocation"]] = relationship(
+        back_populates="input", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint("production_id", "source_no", name="uq_input_prod_source"),
         CheckConstraint("qty > 0", name="ck_production_input_qty_positive"),
         Index("ix_prod_input_source", "source_no"),
+    )
+
+
+class ProductionInputLocation(Base):
+    """一笔投料的库位扣减明细：该笔投料从哪些库位各扣了多少。
+
+    未指定库位的投料可能按库位编号顺序跨多个库位扣减，逐笔记录后，
+    生产单撤销才能“按原消耗库位”把数量返还回各自库位。各明细 qty
+    之和恒等于所属 production_inputs.qty。
+    """
+
+    __tablename__ = "production_input_locations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    input_id: Mapped[int] = mapped_column(
+        ForeignKey("production_inputs.id", ondelete="CASCADE"), nullable=False
+    )
+    location_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+
+    input: Mapped[ProductionInput] = relationship(back_populates="location_parts")
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_input_location_qty_positive"),
+        Index("ix_input_location_input", "input_id"),
     )
 
 
@@ -164,6 +222,38 @@ class BatchReview(Base):
     )
 
     batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
+
+
+class Transfer(Base):
+    """库位调拨单：同一批次的数量在两个库位之间移动。
+
+    调拨只改变库位层余额（来源库位减、目标库位加），批次全局余量不变；
+    调拨单号全局唯一、不得复用。隔离批次允许调拨（调拨不是投料/分装）。
+    """
+
+    __tablename__ = "transfers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    transfer_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    from_location: Mapped[str] = mapped_column(String(64), nullable=False)
+    to_location: Mapped[str] = mapped_column(String(64), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_transfer_qty_positive"),
+        CheckConstraint(
+            "from_location <> to_location", name="ck_transfer_distinct_locations"
+        ),
+        Index("ix_transfer_batch", "batch_no"),
+    )
 
 
 class IdempotencyKey(Base):

@@ -127,6 +127,41 @@ def insufficient(batch_no: str, requested: object, remaining: object) -> AppErro
     )
 
 
+def insufficient_at_location(
+    batch_no: str, location_no: str, requested: object, remaining: object
+) -> AppError:
+    return AppError(
+        "INSUFFICIENT_BALANCE",
+        f"批次 {batch_no!r} 在库位 {location_no!r} 余量不足：请求 {requested}，"
+        f"该库位剩余 {remaining}",
+        409,
+        details={
+            "batch_no": batch_no,
+            "location_no": location_no,
+            "requested": str(requested),
+            "remaining": str(remaining),
+        },
+    )
+
+
+def same_location(location_no: str) -> AppError:
+    return AppError(
+        "SAME_LOCATION",
+        f"来源库位与目标库位相同（{location_no!r}），调拨必须在两个不同库位之间进行",
+        422,
+        details={"location_no": location_no},
+    )
+
+
+def transfer_no_reused(transfer_no: str) -> AppError:
+    return AppError(
+        "TRANSFER_NO_REUSED",
+        f"调拨单号 {transfer_no!r} 已存在，调拨单号不得复用",
+        409,
+        details={"transfer_no": transfer_no},
+    )
+
+
 def unit_mismatch(batch_no: str, expected: str, actual: str) -> AppError:
     return AppError(
         "UNIT_MISMATCH",

@@ -7,7 +7,14 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 
 
 def _to_decimal(value: object) -> Decimal:
@@ -31,6 +38,21 @@ BatchNo = Annotated[str, Field(min_length=1, max_length=64, examples=["RM-202609
 Unit = Annotated[str, Field(min_length=1, max_length=16, examples=["kg"])]
 
 
+def _location_not_blank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("库位编号不得为空白")
+    return value
+
+
+# 库位编号：非空、非纯空白；大小写敏感，按字符串升序参与扣减排序
+LocationNo = Annotated[
+    str,
+    Field(min_length=1, max_length=64, examples=["L-01"]),
+    BeforeValidator(lambda v: v.strip() if isinstance(v, str) else v),
+    AfterValidator(_location_not_blank),
+]
+
+
 class RawBatchIn(BaseModel):
     batch_no: BatchNo
     unit: Unit
@@ -41,6 +63,8 @@ class RawBatchIn(BaseModel):
 class ConsumptionIn(BaseModel):
     batch_no: BatchNo
     quantity: PositiveQty
+    # 可选库位：指定时仅从该库位扣减；缺省时按库位编号升序依次扣减
+    location: LocationNo | None = None
 
 
 class ProductionIn(BaseModel):
@@ -63,9 +87,24 @@ class SplitTargetIn(BaseModel):
 
 
 class SplitIn(BaseModel):
-    """按父批次编号提交一笔分装：多个互异新编号 + 各自正数分装量。"""
+    """按父批次编号提交一笔分装：多个互异新编号 + 各自正数分装量。
+
+    可选 location：指定时仅从父批次该库位扣减分装总量；缺省时按库位
+    编号升序依次扣减。子批次数量一律进入默认库位。
+    """
 
     splits: list[SplitTargetIn] = Field(min_length=1)
+    location: LocationNo | None = None
+
+
+class TransferIn(BaseModel):
+    """库位调拨：凭唯一调拨单号，把某批次的正数数量在两个库位间移动。"""
+
+    transfer_no: BatchNo
+    batch_no: BatchNo
+    from_location: LocationNo
+    to_location: LocationNo
+    quantity: PositiveQty
 
 
 class ReviewIn(BaseModel):
@@ -211,3 +250,30 @@ class SplitOut(BaseModel):
     parent_remaining_qty: float
     splits: list[SplitBatchOut]
     relations: list[SplitRelationOut]
+
+
+class LocationBalanceOut(BaseModel):
+    """批次在单个库位上的余量。"""
+
+    location_no: str
+    qty: float
+
+
+class BatchLocationsOut(BaseModel):
+    """批次的库位余额清单：各库位之和恒等于全局余量 remaining_qty。"""
+
+    batch_no: str
+    remaining_qty: float
+    locations: list[LocationBalanceOut]
+
+
+class TransferOut(BaseModel):
+    """调拨结果：调拨单信息 + 来源/目标两个库位的新余额。"""
+
+    transfer_no: str
+    batch_no: str
+    from_location: str
+    to_location: str
+    quantity: float
+    from_remaining_qty: float
+    to_remaining_qty: float

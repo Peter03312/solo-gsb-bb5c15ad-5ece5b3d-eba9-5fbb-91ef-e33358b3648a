@@ -1,8 +1,9 @@
 # 批次追溯服务（batch-trace）
 
 面向小型食品加工厂的**本地批次追溯服务**：登记原料批次、记录生产投料与产出、
-把批次分装为可独立投料的子批次、查询批次余量与上下游谱系，并在发现疑似污染
-批次时沿投料与分装关系找出并隔离全部后代产出。
+把批次分装为可独立投料的子批次、按库位核算批次库存并在库位间调拨、查询批次
+余量与上下游谱系，并在发现疑似污染批次时沿投料与分装关系找出并隔离全部后代
+产出。
 
 - 语言/框架：Python 3.12 + FastAPI + SQLAlchemy 2
 - 关系数据库：PostgreSQL 16（Docker Compose 一键启动）；无数据库时自动回退本地 SQLite 文件库
@@ -77,12 +78,14 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查 |
-| POST | `/raw-batches` | 登记一个原料批次及初始数量 |
-| POST | `/productions` | 提交一次生产：多批次投入 → 一个产出批次 |
-| POST | `/batches/{batch_no}/splits` | 批次分装：一个父批次 → 多个可独立投料的子批次 |
-| POST | `/productions/{output_no}/cancellation` | 撤销录入错误的生产单：返还来源投料、作废产出与投料边 |
+| POST | `/raw-batches` | 登记一个原料批次及初始数量（数量进入默认库位） |
+| POST | `/productions` | 提交一次生产：多批次投入 → 一个产出批次（可按库位扣减） |
+| POST | `/batches/{batch_no}/splits` | 批次分装：一个父批次 → 多个可独立投料的子批次（可按库位扣减） |
+| POST | `/transfers` | 库位调拨：凭唯一调拨单号在两个库位间移动某批次的数量 |
+| GET | `/batches/{batch_no}/locations` | 查询批次的库位余额（各库位之和 = 全局余量） |
+| POST | `/productions/{output_no}/cancellation` | 撤销录入错误的生产单：按原消耗库位返还来源投料、作废产出与投料边 |
 | GET | `/productions/{output_no}` | 按产出编号查询生产原单据（含撤销状态/原因） |
-| GET | `/batches/{batch_no}` | 查询批次余量与状态 |
+| GET | `/batches/{batch_no}` | 查询批次余量与状态（全局余量，字段与含义不变） |
 | GET | `/batches/{batch_no}/lineage` | 查询上下游谱系（递归，不含已撤销投料边） |
 | POST | `/contamination` | 标记疑似污染批次，返回并隔离全部后代 |
 | POST | `/reviews` | 质检复核确认误报：撤销疑似标记并重算隔离 |
@@ -157,6 +160,34 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
       绝不漏隔离；
     - 幂等沿用既有 `Idempotency-Key` 规则：同键同体重放返回首次结果、
       只扣一次，同键异体 `409 IDEMPOTENCY_CONFLICT`，失败不固化可重试。
+12. 批次按库位核算库存：每个批次的数量同时记录在**全局余量**
+    （`batches.remaining_qty`，原查询字段与含义不变）与**库位余额**
+    （`batch_locations`）两层，各库位之和恒等于全局余量。
+    - **默认库位**：库位核算上线前的既有批次余量、以及此后新登记原料批次的
+      数量，一律归入默认库位 `DEFAULT`；生产产出与分装子批次的数量也进入
+      默认库位。默认库位不参与任何特殊排序；
+    - **调拨**：`POST /transfers` 凭**唯一调拨单号**、批次编号、来源库位、
+      目标库位与正数数量，把数量在两个库位间移动，返回两库位新余额；
+      调拨只动库位层，批次全局余量不变。库位编号为空（`422 VALIDATION_ERROR`）
+      或来源/目标相同（`422 SAME_LOCATION`）、批次不存在（`404 SOURCE_NOT_FOUND`）、
+      来源库位不足（`409 INSUFFICIENT_BALANCE`，details 含 `location_no`）、
+      调拨单号复用（`409 TRANSFER_NO_REUSED`）时**整单拒绝、两库位余额不变**。
+      隔离批次仍不得投料或分装，但**允许调拨**；
+    - **库位余额查询**：`GET /batches/{batch_no}/locations` 返回该批次全部
+      库位行（按库位编号升序，含已扣到 0 的历史库位行）与全局余量，
+      各库位之和恒等于全局余量；
+    - **投料/分装按库位扣减**：生产投料的每笔投入与分装请求均可选带
+      `location` 字段——指定时**仅扣该库位**（该库位不足即整笔拒绝，即使
+      全局余量足够）；未指定时**按库位编号升序**依次扣减（可跨库位）。
+      请求与响应的既有字段保持不变，`location` 为新增可选字段；
+    - **撤销按原消耗库位返还**：生产提交时逐笔记录每个来源的库位扣减明细，
+      撤销生产单时按原明细把数量返还回各自库位（库位核算上线前的历史投料
+      没有明细，按口径返还到默认库位）；
+    - **并发与一致性**：调拨 / 投料 / 分装 / 撤销都在持有批次行锁的同一
+      事务内同步更新两层余额（PostgreSQL `SELECT ... FOR UPDATE`，SQLite
+      `BEGIN IMMEDIATE` 串行化），并发执行绝不超用、绝不出现两层余额失配；
+    - 调拨沿用既有 `Idempotency-Key` 规则：同键同体重放返回首次结果、
+      只调拨一次，同键异体 `409 IDEMPOTENCY_CONFLICT`，失败不固化可重试。
 
 ### 错误响应格式
 
@@ -170,6 +201,7 @@ compose 的端口映射：宿主机 `8080` → 容器 `8080`，可在 `docker-co
 `VALIDATION_ERROR`(422)、`BATCH_QUARANTINED`(409)、`BATCH_NOT_SUSPECT`(409)、
 `OUTPUT_ALREADY_CONSUMED`(409)、`OUTPUT_ALREADY_SPLIT`(409)、`OUTPUT_IS_SUSPECT`(409)、
 `PRODUCTION_HAS_REVIEW`(409)、`PRODUCTION_ALREADY_CANCELLED`(409)、`BATCH_CANCELLED`(409)、
+`SAME_LOCATION`(422)、`TRANSFER_NO_REUSED`(409)、
 `IDEMPOTENCY_CONFLICT`(409)。
 
 ---
@@ -515,6 +547,100 @@ curl -i -X POST http://localhost:8080/productions/MIX-1/cancellation \
 # 来源余量不返还、生产单不撤销
 ```
 
+### 11. 库位核算与调拨：默认库位、库位间移动、按库位扣减
+
+新登记批次的数量进入默认库位 `DEFAULT`；可随时查询批次的库位余额，
+各库位之和恒等于全局余量：
+
+```bash
+curl -X POST http://localhost:8080/raw-batches \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: raw-rm1-01' \
+  -d '{"batch_no":"RM-1","unit":"kg","quantity":"100"}'
+
+curl http://localhost:8080/batches/RM-1/locations
+# {"batch_no":"RM-1","remaining_qty":100.0,
+#  "locations":[{"location_no":"DEFAULT","qty":100.0}]}
+```
+
+凭唯一调拨单号把 30 kg 从默认库位调到 `L-01`，响应返回两库位新余额；
+批次全局余量不变：
+
+```bash
+curl -X POST http://localhost:8080/transfers \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: tr-20261001-01' \
+  -d '{"transfer_no":"TR-20261001-01","batch_no":"RM-1",
+       "from_location":"DEFAULT","to_location":"L-01","quantity":"30"}'
+```
+
+```json
+{"transfer_no":"TR-20261001-01","batch_no":"RM-1",
+ "from_location":"DEFAULT","to_location":"L-01","quantity":30.0,
+ "from_remaining_qty":70.0,"to_remaining_qty":30.0}
+```
+
+```bash
+curl http://localhost:8080/batches/RM-1/locations
+# {"batch_no":"RM-1","remaining_qty":100.0,
+#  "locations":[{"location_no":"DEFAULT","qty":70.0},
+#              {"location_no":"L-01","qty":30.0}]}
+curl http://localhost:8080/batches/RM-1        # 全局余量仍为 100.0
+```
+
+生产投料与分装可选带 `location`：指定时仅扣该库位，未指定时按库位编号
+升序依次扣减（可跨库位）；产出与分装子批次进入默认库位：
+
+```bash
+# 指定库位投料：仅扣 L-01
+curl -X POST http://localhost:8080/productions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: prod-fg1-01' \
+  -d '{"output_batch_no":"FG-1","unit":"kg","output_quantity":25,
+       "inputs":[{"batch_no":"RM-1","quantity":25,"location":"L-01"}]}'
+# RM-1 库位变为 DEFAULT 70 / L-01 5；FG-1 的 25 进入 DEFAULT
+
+# 未指定库位投料：按库位编号升序扣（DEFAULT 先于 L-01）
+curl -X POST http://localhost:8080/productions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: prod-fg2-01' \
+  -d '{"output_batch_no":"FG-2","unit":"kg","output_quantity":75,
+       "inputs":[{"batch_no":"RM-1","quantity":75}]}'
+# 先扣 DEFAULT 70、再扣 L-01 5
+
+# 分装同样可选 location（仅从该库位扣减分装总量）
+curl -X POST http://localhost:8080/batches/RM-1/splits \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: split-rm1-loc-01' \
+  -d '{"location":"L-01","splits":[{"batch_no":"RM-1-C","quantity":"5"}]}'
+```
+
+撤销生产单按**原消耗库位**返还（上例 FG-1 撤销后 25 kg 回到 L-01 而非
+DEFAULT）；隔离批次不得投料/分装，但允许调拨：
+
+```bash
+curl -X POST http://localhost:8080/contamination \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: cont-rm1-02' \
+  -d '{"batch_no":"RM-1","note":"待复检"}'
+# 隔离后调拨仍允许（例如移入隔离库位 L-Q）
+curl -X POST http://localhost:8080/transfers \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: tr-20261001-02' \
+  -d '{"transfer_no":"TR-20261001-02","batch_no":"RM-1",
+       "from_location":"DEFAULT","to_location":"L-Q","quantity":"10"}'
+# 201；但投料/分装仍被 409 BATCH_QUARANTINED 拒绝
+```
+
+任一不符整笔拒绝、两库位余额不变（示例）：
+
+```bash
+# 来源/目标库位相同：422 SAME_LOCATION
+# 库位编号为空或纯空白：422 VALIDATION_ERROR
+# 批次不存在：404 SOURCE_NOT_FOUND
+# 来源库位不足（含来源库位从未存放过该批次）：409 INSUFFICIENT_BALANCE
+#   details 含 batch_no / location_no / requested / remaining
+# 调拨单号已被占用：409 TRANSFER_NO_REUSED
+# 数量为 0/负数：422 VALIDATION_ERROR
+```
+
+调拨沿用既有幂等约定：同 `Idempotency-Key` + 同请求体重放返回首次结果、
+只调拨一次；同键异体 `409 IDEMPOTENCY_CONFLICT`；失败请求不固化、可修正后
+以同键重试。
+
 ---
 
 ## 五、项目结构
@@ -522,17 +648,21 @@ curl -i -X POST http://localhost:8080/productions/MIX-1/cancellation \
 ```
 app/
   config.py       # 环境变量配置
-  db.py           # 引擎/会话、SQLite 写锁与 PG 行锁支撑、建表与增量补列
-  models.py       # batches / productions(含撤销字段) / production_inputs /
-                  # batch_splits(分装关系) / batch_reviews / idempotency_keys
-  schemas.py      # Pydantic 请求响应模型（正数、定点数、非空撤销原因、分装校验）
+  db.py           # 引擎/会话、SQLite 写锁与 PG 行锁支撑、建表与增量补列、
+                  # 既有批次余量回填默认库位
+  models.py       # batches / batch_locations(库位余额) / productions(含撤销字段) /
+                  # production_inputs / production_input_locations(投料库位明细) /
+                  # batch_splits(分装关系) / transfers(调拨单) / batch_reviews /
+                  # idempotency_keys
+  schemas.py      # Pydantic 请求响应模型（正数、定点数、非空撤销原因、分装校验、
+                  # 库位编号与调拨单校验）
   errors.py       # 业务错误码
-  service.py      # 核心逻辑：登记、分装、生产事务、撤销返还、幂等、递归谱系
-                  # （投料边+分装边）、污染传播、复核重算
+  service.py      # 核心逻辑：登记、库位扣减/入账、调拨、分装、生产事务、撤销返还、
+                  # 幂等、递归谱系（投料边+分装边）、污染传播、复核重算
   routes.py       # HTTP 路由
   main.py         # FastAPI 应用与异常处理
   entrypoint.py   # 容器入口：等待数据库 → 建表 → 启动
-tests/            # 端到端 + 并发测试（85 个用例，含分装/分装并发）
+tests/            # 端到端 + 并发测试（110 个用例，含库位/调拨/库位并发）
 Dockerfile
 docker-compose.yml
 ```
@@ -567,11 +697,23 @@ docker-compose.yml
   经行锁与表锁互斥，结果等价于某一串行顺序，绝不漏隔离。生产产出一旦存在
   分装边，撤销校验即以 `OUTPUT_ALREADY_SPLIT` 拒绝，杜绝“撤销成功且分装仍
   在谱系中传播”的矛盾结局。
+- 库位层与全局层余额的每一次变动都在**持有批次行锁的同一事务**内完成：
+  调拨、投料、分装、撤销返还都先锁批次行（PostgreSQL `SELECT ... FOR
+  UPDATE`，按编号升序；SQLite 由 `BEGIN IMMEDIATE` 全库串行），再同步更新
+  `batch_locations` 与 `batches.remaining_qty`，因此两层余额绝不失配、并发
+  绝不超用。调拨只持有一把批次行锁（只移动单个批次的库位数量），不会与
+  其它事务形成死锁环；生产提交逐笔记录投料的库位扣减明细
+  （`production_input_locations`），撤销据此按原库位返还。
 
-> 注：新表 `batch_splits`、`batch_reviews` 与 `productions` 表的撤销字段
+> 注：新表 `batch_locations`、`production_input_locations`、`transfers`、
+> `batch_splits`、`batch_reviews` 与 `productions` 表的撤销字段
 > （`is_cancelled` / `cancel_reason` / `cancelled_at`）随启动/入口的
 > `CREATE TABLE IF NOT EXISTS` 与幂等 `ALTER TABLE ... ADD COLUMN` 自动
-> 创建/补齐，既有数据库升级无需手工迁移；现有登记、生产、污染标记、复核、
-> 批次/谱系查询、撤销接口的请求、响应字段与启动方式均保持兼容——
-> 谱系响应的 `edges` 仅**新增** `kind` 字段（既有投料边为 `"PRODUCTION"`），
-> 批次/谱系响应仍**新增** `is_cancelled` 字段，未撤销/未分装数据行为不变。
+> 创建/补齐；启动时还会把**没有任何库位行的既有批次**余量一次性回填到默认
+> 库位 `DEFAULT`（幂等，余量为 0 的批次无需库位行），既有数据库升级无需
+> 手工迁移；现有登记、生产、污染标记、复核、批次/谱系查询、撤销、分装接口
+> 的请求、响应字段与启动方式均保持兼容——谱系响应的 `edges` 仅**新增**
+> `kind` 字段（既有投料边为 `"PRODUCTION"`），批次/谱系响应仍**新增**
+> `is_cancelled` 字段，生产投料与分装请求仅**新增**可选 `location` 字段，
+> 未指定库位时行为与既有口径一致（从全部可用数量中扣减），未调拨过的批次
+> 全部数量都在默认库位。

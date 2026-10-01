@@ -87,6 +87,35 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=get_engine())
     _migrate_additive_columns(get_engine())
+    _backfill_batch_locations(get_engine())
+
+
+def _backfill_batch_locations(engine: Engine) -> None:
+    """把“还没有任何库位行”的批次余量回填到默认库位（幂等）。
+
+    库位核算上线前创建的批次没有 batch_locations 行；这里按
+    “现有批次余量归入默认库位”的规则一次性补齐。已有库位行的批次
+    （新库位核算下创建的）跳过；余量为 0 的批次无需库位行
+    （空集之和为 0，仍满足两层一致）。新表由 create_all 先行建好。
+    """
+    from .models import DEFAULT_LOCATION_NO
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO batch_locations (batch_no, location_no, qty)
+                SELECT b.batch_no, :default_loc, b.remaining_qty
+                FROM batches b
+                WHERE b.remaining_qty > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM batch_locations bl
+                      WHERE bl.batch_no = b.batch_no
+                  )
+                """
+            ),
+            {"default_loc": DEFAULT_LOCATION_NO},
+        )
 
 
 def _migrate_additive_columns(engine: Engine) -> None:

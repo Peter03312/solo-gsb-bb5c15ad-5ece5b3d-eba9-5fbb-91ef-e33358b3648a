@@ -14,12 +14,16 @@ from sqlalchemy.orm import Session, selectinload
 
 from . import errors
 from .models import (
+    DEFAULT_LOCATION_NO,
     Batch,
+    BatchLocation,
     BatchReview,
     BatchSplit,
     IdempotencyKey,
     Production,
     ProductionInput,
+    ProductionInputLocation,
+    Transfer,
 )
 from .schemas import (
     CancelIn,
@@ -28,6 +32,7 @@ from .schemas import (
     ReviewIn,
     SplitIn,
     SuspectIn,
+    TransferIn,
 )
 
 # ---------------------------------------------------------------- 幂等支持
@@ -115,11 +120,81 @@ def AppError_conflict(key: str) -> errors.AppError:
     )
 
 
+# ---------------------------------------------------------------- 库位核算
+
+
+def _get_location_row(
+    session: Session, batch_no: str, location_no: str
+) -> BatchLocation | None:
+    return session.get(BatchLocation, (batch_no, location_no))
+
+
+def _credit_location(
+    session: Session, batch_no: str, location_no: str, qty: Decimal
+) -> BatchLocation:
+    """给某批次的某库位入账（行不存在则新建）。调用方须已持有批次行锁。"""
+    row = _get_location_row(session, batch_no, location_no)
+    if row is None:
+        row = BatchLocation(batch_no=batch_no, location_no=location_no, qty=qty)
+        session.add(row)
+        session.flush()
+    else:
+        row.qty += qty
+    return row
+
+
+def _deduct_from_locations(
+    session: Session,
+    batch: Batch,
+    amount: Decimal,
+    location: str | None = None,
+) -> list[tuple[str, Decimal]]:
+    """从批次库位层扣减 amount，返回 [(库位编号, 实扣量)] 明细。
+
+    - 指定库位：仅扣该库位，该库位不足即整笔拒绝（INSUFFICIENT_BALANCE）；
+    - 未指定库位：按库位编号升序依次扣减（默认库位无特殊优先级），
+      各库位之和不足即整笔拒绝。
+
+    调用方必须先持有批次行锁（生产/分装/调拨/撤销均先锁批次行），
+    库位层与全局层的扣减在同一事务内完成，两层余额绝不失配。
+    本函数只动库位层；批次 remaining_qty 由调用方同步扣减。
+    """
+    if location is not None:
+        row = _get_location_row(session, batch.batch_no, location)
+        available = row.qty if row is not None else Decimal("0")
+        if amount > available:
+            raise errors.insufficient_at_location(
+                batch.batch_no, location, amount, available
+            )
+        row.qty -= amount
+        return [(location, amount)]
+
+    rows = session.execute(
+        select(BatchLocation)
+        .where(BatchLocation.batch_no == batch.batch_no, BatchLocation.qty > 0)
+        .order_by(BatchLocation.location_no)
+    ).scalars().all()
+    total_available = sum((r.qty for r in rows), Decimal("0"))
+    if amount > total_available:
+        raise errors.insufficient(batch.batch_no, amount, total_available)
+
+    parts: list[tuple[str, Decimal]] = []
+    remaining = amount
+    for row in rows:
+        if remaining <= 0:
+            break
+        take = min(row.qty, remaining)
+        row.qty -= take
+        parts.append((row.location_no, take))
+        remaining -= take
+    return parts
+
+
 # ---------------------------------------------------------------- 批次操作
 
 
 def register_raw_batch(session: Session, data: RawBatchIn) -> Batch:
-    """登记一个原料批次。编号不得复用。"""
+    """登记一个原料批次。编号不得复用；数量归入默认库位。"""
     existing = session.get(Batch, data.batch_no)
     if existing is not None:
         raise errors.batch_exists(data.batch_no)
@@ -136,6 +211,8 @@ def register_raw_batch(session: Session, data: RawBatchIn) -> Batch:
         session.flush()
     except IntegrityError:
         raise errors.batch_exists(data.batch_no) from None
+    # 新登记批次的数量一律进入默认库位（全局余量与库位余量同步建立）
+    _credit_location(session, batch.batch_no, DEFAULT_LOCATION_NO, data.quantity)
     return batch
 
 
@@ -272,6 +349,8 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
         session.flush()  # 让产出批次主键可用，并尽早暴露编号冲突
     except IntegrityError:
         raise errors.batch_exists(data.output_batch_no) from None
+    # 产出数量进入默认库位
+    _credit_location(session, output.batch_no, DEFAULT_LOCATION_NO, data.output_quantity)
 
     production = Production(
         output_no=output.batch_no, output_qty=data.output_quantity
@@ -281,13 +360,24 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
 
     for item in data.inputs:
         batch = sources[item.batch_no]
+        # 库位层扣减（指定库位仅扣该库位；缺省按库位编号升序），
+        # 与全局余量扣减同事务完成；明细落库供撤销时按原库位返还
+        parts = _deduct_from_locations(session, batch, item.quantity, item.location)
         batch.remaining_qty -= item.quantity
-        session.add(
-            ProductionInput(
-                production_id=production.id,
-                source_no=batch.batch_no,
-                qty=item.quantity,
-            )
+        input_row = ProductionInput(
+            production_id=production.id,
+            source_no=batch.batch_no,
+            qty=item.quantity,
+        )
+        session.add(input_row)
+        session.flush()
+        session.add_all(
+            [
+                ProductionInputLocation(
+                    input_id=input_row.id, location_no=loc, qty=qty
+                )
+                for loc, qty in parts
+            ]
         )
 
     session.flush()
@@ -351,6 +441,10 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
     if total > parent.remaining_qty:
         raise errors.insufficient(parent_no, total, parent.remaining_qty)
 
+    # 库位层扣减分装总量（指定库位仅扣该库位；缺省按库位编号升序），
+    # 与全局余量扣减同一事务完成；任一不符整笔回滚
+    _deduct_from_locations(session, parent, total, data.location)
+
     created: list[Batch] = []
     relations: list[BatchSplit] = []
     for item in data.splits:
@@ -365,6 +459,8 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
             session.flush()  # 尽早暴露并发下的编号冲突
         except IntegrityError:
             raise errors.batch_exists(item.batch_no) from None
+        # 子批次数量一律进入默认库位
+        _credit_location(session, child.batch_no, DEFAULT_LOCATION_NO, item.quantity)
         created.append(child)
         relations.append(
             BatchSplit(parent_no=parent_no, child_no=item.batch_no, qty=item.quantity)
@@ -396,6 +492,90 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
                 "quantity": float(child.initial_qty),
             }
             for child in created
+        ],
+    }
+
+
+# ---------------------------------------------------------------- 库位调拨
+
+
+def transfer_location(session: Session, data: TransferIn) -> dict[str, Any]:
+    """库位调拨：把某批次的正数数量从来源库位移动到目标库位。
+
+    只动库位层余额（来源减、目标加），批次全局余量不变。任一不符
+    整笔拒绝、两库位余额不变：
+    1. 来源/目标库位编号不得相同（SAME_LOCATION 422；空编号由入参校验拦截）；
+    2. 批次须存在（SOURCE_NOT_FOUND 404）；
+    3. 调拨单号全局唯一、不得复用（TRANSFER_NO_REUSED 409）；
+    4. 来源库位余额须充足（INSUFFICIENT_BALANCE 409）。
+
+    隔离批次允许调拨（调拨不是投料/分装，不改变可用性语义）。
+
+    并发：先锁批次行（与生产/分装/撤销同一把行锁，SQLite 由
+    BEGIN IMMEDIATE 全库串行），库位扣减/入账与调拨单在同一事务
+    落库；调拨只持有一把批次行锁，不会与其它事务形成死锁环。
+    """
+    if data.from_location == data.to_location:
+        raise errors.same_location(data.from_location)
+
+    batch = _lock_batch(session, data.batch_no)
+    if batch is None:
+        raise errors.batch_not_found(data.batch_no)
+
+    existing = session.execute(
+        select(Transfer.id).where(Transfer.transfer_no == data.transfer_no)
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise errors.transfer_no_reused(data.transfer_no)
+
+    # 来源库位扣减（不足即整笔拒绝），目标库位入账
+    _deduct_from_locations(session, batch, data.quantity, data.from_location)
+    to_row = _credit_location(session, data.batch_no, data.to_location, data.quantity)
+
+    transfer = Transfer(
+        transfer_no=data.transfer_no,
+        batch_no=data.batch_no,
+        from_location=data.from_location,
+        to_location=data.to_location,
+        qty=data.quantity,
+    )
+    session.add(transfer)
+    try:
+        session.flush()  # 兜底并发下的调拨单号竞争
+    except IntegrityError:
+        raise errors.transfer_no_reused(data.transfer_no) from None
+
+    from_row = _get_location_row(session, data.batch_no, data.from_location)
+    return {
+        "transfer_no": data.transfer_no,
+        "batch_no": data.batch_no,
+        "from_location": data.from_location,
+        "to_location": data.to_location,
+        "quantity": float(data.quantity),
+        "from_remaining_qty": float(from_row.qty if from_row is not None else 0),
+        "to_remaining_qty": float(to_row.qty),
+    }
+
+
+def get_batch_locations(session: Session, batch_no: str) -> dict[str, Any]:
+    """查询批次的库位余额清单（按库位编号升序）。
+
+    各库位之和恒等于批次全局余量 remaining_qty；已扣到 0 的库位行
+    保留在清单中（便于审计该批次曾存放的库位），不影响求和口径。
+    """
+    batch = session.get(Batch, batch_no)
+    if batch is None:
+        raise errors.batch_not_found(batch_no)
+    rows = session.execute(
+        select(BatchLocation)
+        .where(BatchLocation.batch_no == batch_no)
+        .order_by(BatchLocation.location_no)
+    ).scalars().all()
+    return {
+        "batch_no": batch_no,
+        "remaining_qty": float(batch.remaining_qty),
+        "locations": [
+            {"location_no": row.location_no, "qty": float(row.qty)} for row in rows
         ],
     }
 
@@ -516,6 +696,13 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
             raise errors.batch_not_found(pi.source_no)
         # 即使来源批次已隔离，也在本事务内返还其原投料量
         source.remaining_qty += pi.qty
+        # 库位层按“原消耗库位”逐笔返还；库位核算上线前的历史投料没有
+        # 库位明细，按“现有余量归默认库位”的口径返还到默认库位
+        parts = [(p.location_no, p.qty) for p in pi.location_parts]
+        if not parts:
+            parts = [(DEFAULT_LOCATION_NO, pi.qty)]
+        for loc, qty in parts:
+            _credit_location(session, pi.source_no, loc, qty)
         returned.append(
             {"batch_no": pi.source_no, "returned_quantity": pi.qty}
         )
