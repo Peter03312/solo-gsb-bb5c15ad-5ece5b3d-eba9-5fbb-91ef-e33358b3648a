@@ -87,6 +87,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=get_engine())
     _migrate_additive_columns(get_engine())
+    _backfill_locations(get_engine())
 
 
 def _migrate_additive_columns(engine: Engine) -> None:
@@ -110,6 +111,9 @@ def _migrate_additive_columns(engine: Engine) -> None:
             ("cancel_reason", "TEXT", "TEXT"),
             ("cancelled_at", "TIMESTAMPTZ", "DATETIME"),
         ],
+        "production_inputs": [
+            ("location_code", "VARCHAR(32)", "VARCHAR(32)"),
+        ],
     }
 
     inspector = inspect(engine)
@@ -131,6 +135,62 @@ def _migrate_additive_columns(engine: Engine) -> None:
     with engine.begin() as conn:
         for table, name, column_def in missing:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {column_def}"))
+
+
+def _backfill_locations(engine) -> None:
+    """为引入库位层之前的既有数据回填默认库位。
+
+    - 每个尚缺任何库位行的批次：以其当前全局余量在默认库位建行
+      （新批次在业务事务内建行，这里通常只处理升级前的老批次）；
+    - 每笔尚无逐库位消耗明细的投料行：整笔记入默认库位。
+      这样撤销历史生产单时统一按“原消耗库位”返还到默认库位。
+
+    幂等：以 NOT EXISTS 谓词跳过已回填/已新建的数据，重复启动无副作用。
+    整个回填写事务与业务事务一样在 SQLite 上以 BEGIN IMMEDIATE 串行。
+    """
+    from .models import DEFAULT_LOCATION_CODE
+
+    inspector = inspect(engine)
+    if not inspector.has_table("batches"):
+        return
+    # 注意：inspection 必须在写事务开始前完成（同 _migrate_additive_columns
+    # 的约束）——SQLite 写事务持 BEGIN IMMEDIATE 全库写锁，事务内再借连接
+    # 做 inspector 查询会自死锁。
+    has_inputs = inspector.has_table("production_inputs") and inspector.has_table(
+        "production_input_locations"
+    )
+
+    default = DEFAULT_LOCATION_CODE
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO batch_locations (batch_no, location_code, qty, created_at)
+                SELECT b.batch_no, :loc, b.remaining_qty, CURRENT_TIMESTAMP
+                FROM batches b
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM batch_locations bl WHERE bl.batch_no = b.batch_no
+                )
+                """
+            ),
+            {"loc": default},
+        )
+        if has_inputs:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO production_input_locations
+                        (production_input_id, location_code, qty)
+                    SELECT pi.id, :loc, pi.qty
+                    FROM production_inputs pi
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM production_input_locations pil
+                        WHERE pil.production_input_id = pi.id
+                    )
+                    """
+                ),
+                {"loc": default},
+            )
 
 
 @contextmanager

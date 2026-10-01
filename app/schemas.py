@@ -7,7 +7,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationInfo, field_validator
 
 
 def _to_decimal(value: object) -> Decimal:
@@ -31,6 +31,21 @@ BatchNo = Annotated[str, Field(min_length=1, max_length=64, examples=["RM-202609
 Unit = Annotated[str, Field(min_length=1, max_length=16, examples=["kg"])]
 
 
+def _to_location_code(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("库位编号必须为字符串")
+    code = value.strip()
+    if not code:
+        raise ValueError("库位编号不得为空白")
+    if len(code) > 32:
+        raise ValueError("库位编号长度不得超过 32")
+    return code
+
+
+# 库位编号：非空、非纯空白、最长 32；两端空白自动去除
+LocationCode = Annotated[str, BeforeValidator(_to_location_code)]
+
+
 class RawBatchIn(BaseModel):
     batch_no: BatchNo
     unit: Unit
@@ -41,6 +56,9 @@ class RawBatchIn(BaseModel):
 class ConsumptionIn(BaseModel):
     batch_no: BatchNo
     quantity: PositiveQty
+    # 投料库位：未指定（省略/为 null）时按库位编号顺序跨库位扣减；
+    # 指定时仅扣减该库位（该库位不存在或余额不足整笔拒绝）。
+    location_code: LocationCode | None = None
 
 
 class ProductionIn(BaseModel):
@@ -66,6 +84,29 @@ class SplitIn(BaseModel):
     """按父批次编号提交一笔分装：多个互异新编号 + 各自正数分装量。"""
 
     splits: list[SplitTargetIn] = Field(min_length=1)
+    # 分装出库库位：未指定时按库位编号顺序跨库位扣减父批次；指定时仅扣该库位。
+    # 分装产生的子批次一律进入默认库位。
+    location_code: LocationCode | None = None
+
+
+class TransferIn(BaseModel):
+    """库位调拨：同一批次在两个不同库位间移动正数数量。"""
+
+    transfer_no: Annotated[str, Field(min_length=1, max_length=64, examples=["TR-20261001-01"])]
+    batch_no: BatchNo
+    source_location: LocationCode
+    target_location: LocationCode
+    quantity: PositiveQty
+
+    @field_validator("target_location")
+    @classmethod
+    def _locations_must_differ(cls, value: str, info: ValidationInfo) -> str:
+        source = info.data.get("source_location")
+        # source_location 先于 target_location 校验，LocationCode 已去空白；
+        # 去空白后相同（如 " A " 与 "A"）即视为同一库位，整单拒绝。
+        if source is not None and source == value:
+            raise ValueError("来源库位与目标库位不得相同")
+        return value
 
 
 class ReviewIn(BaseModel):
@@ -211,3 +252,36 @@ class SplitOut(BaseModel):
     parent_remaining_qty: float
     splits: list[SplitBatchOut]
     relations: list[SplitRelationOut]
+
+
+class LocationBalanceOut(BaseModel):
+    """批次在单个库位上的余额。"""
+
+    location_code: str
+    quantity: float
+
+
+class BatchLocationsOut(BaseModel):
+    """批次的库位层库存：逐库位余额（按库位编号排序）与全局余量。
+
+    恒等式：locations 各项 quantity 之和 == remaining_qty（全局余量）。
+    """
+
+    batch_no: str
+    unit: str
+    remaining_qty: float
+    locations: list[LocationBalanceOut]
+
+
+class TransferOut(BaseModel):
+    """调拨结果：单号、批次、来源/目标库位与调拨后两库位余额。"""
+
+    transfer_no: str
+    batch_no: str
+    source_location: str
+    target_location: str
+    quantity: float
+    source_balance: float
+    target_balance: float
+    remaining_qty: float
+    locations: list[LocationBalanceOut]

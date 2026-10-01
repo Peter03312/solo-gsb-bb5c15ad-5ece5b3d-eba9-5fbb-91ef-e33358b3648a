@@ -24,6 +24,10 @@ from .db import Base
 # Numeric 精度：整数 18 位、小数 4 位，满足食品厂计量场景
 QTY = Numeric(18, 4)
 
+# 默认库位编号：既有批次余量与新登记批次的初始数量都归入该库位；
+# 生产产出与分装子批次也始终进入默认库位。
+DEFAULT_LOCATION_CODE = "DEFAULT"
+
 
 class Batch(Base):
     """批次：既可能是原料批次，也可能是生产产出批次。"""
@@ -100,6 +104,9 @@ class ProductionInput(Base):
         String(64), ForeignKey("batches.batch_no"), nullable=False
     )
     qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    # 投料时指定的库位：未指定库位（按编号顺序跨库位扣减）时为 None。
+    # 仅用于展示/排查；逐库位的实际消耗见 ProductionInputLocation。
+    location_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     production: Mapped[Production] = relationship(back_populates="inputs")
     source_batch: Mapped[Batch] = relationship(
@@ -142,6 +149,89 @@ class BatchSplit(Base):
     __table_args__ = (
         CheckConstraint("qty > 0", name="ck_batch_split_qty_positive"),
         Index("ix_batch_split_parent", "parent_no"),
+    )
+
+
+class BatchLocation(Base):
+    """批次在单个库位上的余量（库位层库存）。
+
+    两层库存恒等式：同一批次全部 BatchLocation.qty 之和必须等于
+    Batch.remaining_qty（全局余量，字段含义与引入库位前完全一致）。
+    登记/产出/分装建批次时即写入默认库位行；既有批次由启动回填补建。
+    """
+
+    __tablename__ = "batch_locations"
+
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False, primary_key=True
+    )
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False, primary_key=True)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    batch: Mapped[Batch] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("qty >= 0", name="ck_batch_location_qty_non_negative"),
+        Index("ix_batch_location_location", "location_code"),
+    )
+
+
+class ProductionInputLocation(Base):
+    """一笔投料在单个库位上的实际消耗量。
+
+    指定库位投料时恰有一行；未指定库位（按库位编号顺序跨库位扣减）时
+    可有若干行，各行之和等于对应 ProductionInput.qty。生产撤销按这些
+    行的“原消耗库位”逐笔返还，未指定库位的历史投料（回填为整笔计入
+    默认库位）也照此路径返还。
+    """
+
+    __tablename__ = "production_input_locations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    production_input_id: Mapped[int] = mapped_column(
+        ForeignKey("production_inputs.id", ondelete="CASCADE"), nullable=False
+    )
+    location_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+
+    production_input: Mapped[ProductionInput] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_input_location_qty_positive"),
+        Index("ix_input_location_input", "production_input_id"),
+    )
+
+
+class StockTransfer(Base):
+    """库位调拨单：同一批次在两个库位间的一次正数数量移动。
+
+    调拨只改变库位层分布，不改变批次全局余量。调拨单号全局唯一、
+    不得复用；成功单据整行保留供幂等重放与审计。隔离批次允许调拨
+    （隔离只禁止投料/分装），已撤销产出批次亦可调拨。
+    """
+
+    __tablename__ = "stock_transfers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    transfer_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    batch_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False
+    )
+    source_location: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_location: Mapped[str] = mapped_column(String(32), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    batch: Mapped[Batch] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_stock_transfer_qty_positive"),
+        Index("ix_stock_transfer_batch", "batch_no"),
     )
 
 

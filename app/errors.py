@@ -118,12 +118,52 @@ def output_already_split(batch_no: str, child_nos: list[str]) -> AppError:
     )
 
 
-def insufficient(batch_no: str, requested: object, remaining: object) -> AppError:
+def insufficient(batch_no: str, requested: object, remaining: object,
+                 location_code: str | None = None) -> AppError:
+    if location_code is not None:
+        message = (
+            f"批次 {batch_no!r} 库位 {location_code!r} 余额不足："
+            f"请求 {requested}，该库位剩余 {remaining}"
+        )
+    else:
+        message = f"批次 {batch_no!r} 余量不足：请求 {requested}，剩余 {remaining}"
     return AppError(
         "INSUFFICIENT_BALANCE",
-        f"批次 {batch_no!r} 余量不足：请求 {requested}，剩余 {remaining}",
+        message,
         409,
-        details={"batch_no": batch_no, "requested": str(requested), "remaining": str(remaining)},
+        details={
+            "batch_no": batch_no,
+            "requested": str(requested),
+            "remaining": str(remaining),
+            **({"location_code": location_code} if location_code is not None else {}),
+        },
+    )
+
+
+def location_not_found(batch_no: str, location_code: str) -> AppError:
+    return AppError(
+        "LOCATION_NOT_FOUND",
+        f"批次 {batch_no!r} 不存在库位 {location_code!r} 的余额记录",
+        404,
+        details={"batch_no": batch_no, "location_code": location_code},
+    )
+
+
+def transfer_same_location(location_code: str) -> AppError:
+    return AppError(
+        "TRANSFER_SAME_LOCATION",
+        f"来源库位与目标库位均为 {location_code!r}，调拨要求两个不同的库位",
+        422,
+        details={"location_code": location_code},
+    )
+
+
+def transfer_no_exists(transfer_no: str) -> AppError:
+    return AppError(
+        "TRANSFER_NO_REUSED",
+        f"调拨单号 {transfer_no!r} 已存在，调拨单号不得复用",
+        409,
+        details={"transfer_no": transfer_no},
     )
 
 

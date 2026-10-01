@@ -9,17 +9,23 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from . import errors
 from .models import (
+    DEFAULT_LOCATION_CODE,
     Batch,
+    BatchLocation,
     BatchReview,
     BatchSplit,
     IdempotencyKey,
     Production,
     ProductionInput,
+    ProductionInputLocation,
+    StockTransfer,
 )
 from .schemas import (
     CancelIn,
@@ -28,6 +34,7 @@ from .schemas import (
     ReviewIn,
     SplitIn,
     SuspectIn,
+    TransferIn,
 )
 
 # ---------------------------------------------------------------- 幂等支持
@@ -132,6 +139,14 @@ def register_raw_batch(session: Session, data: RawBatchIn) -> Batch:
         note=data.note,
     )
     session.add(batch)
+    # 新登记批次：初始数量全部进入默认库位
+    session.add(
+        BatchLocation(
+            batch_no=data.batch_no,
+            location_code=DEFAULT_LOCATION_CODE,
+            qty=data.quantity,
+        )
+    )
     try:
         session.flush()
     except IntegrityError:
@@ -184,6 +199,150 @@ def _lock_batches_in_order(
     return locked
 
 
+# ---------------------------------------------------------------- 库位层库存
+
+def _lock_locations(
+    session: Session, batch_no: str, location_codes: list[str]
+) -> dict[str, BatchLocation]:
+    """锁定某批次给定库位的余额行并按库位编号返回（PostgreSQL FOR UPDATE）。
+
+    调用方必须已持有该批次行锁（所有事务先按批次编号升序锁批次，再锁库位，
+    以保证全局统一加锁顺序）；SQLite 由 BEGIN IMMEDIATE 全库写锁串行，
+    FOR UPDATE 为空操作。
+    """
+    codes = sorted(set(location_codes))
+    if not codes:
+        return {}
+    stmt = select(BatchLocation).where(
+        BatchLocation.batch_no == batch_no,
+        BatchLocation.location_code.in_(codes),
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        stmt = stmt.with_for_update()
+    rows = session.execute(stmt).scalars().all()
+    return {r.location_code: r for r in rows}
+
+
+def _ensure_location_rows(
+    session: Session, batch_no: str, location_codes: list[str]
+) -> None:
+    """确保某批次的指定库位行存在（余额 0），幂等。
+
+    调拨可能首次把数量移入一个此前没有余额的库位。并发下两个事务可能同时
+    尝试 INSERT 同一目标库位行：用 ON CONFLICT DO NOTHING 让冲突方插入
+    空转，随后统一 SELECT ... FOR UPDATE 即可串行；PG/SQLite 各用其方言
+    语句，避免“插入失败导致整事务回滚再重试”的写法。
+    """
+    codes = sorted(set(c for c in location_codes if c != DEFAULT_LOCATION_CODE))
+    if not codes:
+        return
+    dialect = session.get_bind().dialect.name
+    rows = [
+        {"batch_no": batch_no, "location_code": code, "qty": Decimal("0")}
+        for code in codes
+    ]
+    if dialect == "postgresql":
+        stmt = pg_insert(BatchLocation).values(rows).on_conflict_do_nothing(
+            index_elements=["batch_no", "location_code"]
+        )
+    else:
+        stmt = sqlite_insert(BatchLocation).values(rows).on_conflict_do_nothing(
+            index_elements=["batch_no", "location_code"]
+        )
+    session.execute(stmt)
+
+
+def _allocate_consumption(
+    session: Session, batch_no: str, quantity: Decimal, location_code: str | None
+) -> tuple[dict[str, Decimal], dict[str, BatchLocation]]:
+    """为一笔投料/分装扣减规划库位分配方案（不做任何修改）。
+
+    - 指定库位：只允许扣该库位；库位不存在报 LOCATION_NOT_FOUND(404)，
+      该库位余额不足报 INSUFFICIENT_BALANCE(409)（details 带库位编号）；
+    - 未指定库位：按库位编号升序跨库位依次扣减；全局余量不足时按既有
+      INSUFFICIENT_BALANCE(409) 拒绝。
+
+    返回 (分配方案, 已锁定库位行)；方案仅含扣减量为正的库位，调用方据此改
+    库位行。调用方必须已持有该批次行锁，故此处读到的库位行集合在事务内
+    不会被并发调拨改变（新库位只能由同批次的调拨事务创建，而它同样先锁批次）。
+    """
+    if location_code is not None:
+        locked = _lock_locations(session, batch_no, [location_code])
+        loc = locked.get(location_code)
+        if loc is None:
+            raise errors.location_not_found(batch_no, location_code)
+        if quantity > loc.qty:
+            raise errors.insufficient(
+                batch_no, quantity, loc.qty, location_code=location_code
+            )
+        return {location_code: quantity}, locked
+
+    # 调用方已持批次行锁：一次性对该批次全部库位行加锁并据此分配，
+    # 读与锁在同一语句完成（PG FOR UPDATE；SQLite 为空操作但有全库写锁）。
+    stmt = select(BatchLocation).where(BatchLocation.batch_no == batch_no)
+    if session.get_bind().dialect.name == "postgresql":
+        stmt = stmt.with_for_update()
+    existing = session.execute(stmt).scalars().all()
+    by_code = {r.location_code: r for r in existing}
+    total = sum((r.qty for r in existing), Decimal("0"))
+    if quantity > total:
+        raise errors.insufficient(batch_no, quantity, total)
+
+    codes = sorted(by_code)
+    remaining = quantity
+    plan: dict[str, Decimal] = {}
+    for code in codes:
+        available = by_code[code].qty
+        if available <= 0 or remaining <= 0:
+            continue
+        take = min(available, remaining)
+        plan[code] = take
+        remaining -= take
+    # 库位行之和 == 全局余量（不变式），上面已比较过 quantity <= 总量，
+    # 因此剩余必然被分配完。
+    return plan, by_code
+
+
+def _apply_location_plan(
+    location_rows: dict[str, BatchLocation], plan: dict[str, Decimal]
+) -> None:
+    """按分配方案扣减已锁定的库位行。"""
+    for code, take in plan.items():
+        location_rows[code].qty -= take
+
+
+def _create_batch_with_default_location(
+    session: Session, batch_no: str, unit: str, qty: Decimal
+) -> Batch:
+    """创建批次并在默认库位写入等量余额（生产产出 / 分装子批次）。"""
+    batch = Batch(batch_no=batch_no, unit=unit, initial_qty=qty, remaining_qty=qty)
+    session.add(batch)
+    session.add(
+        BatchLocation(batch_no=batch_no, location_code=DEFAULT_LOCATION_CODE, qty=qty)
+    )
+    return batch
+
+
+def get_batch_locations(session: Session, batch_no: str) -> dict[str, Any]:
+    """查询批次逐库位余额（按库位编号排序）及全局余量；两者恒等。"""
+    batch = session.get(Batch, batch_no)
+    if batch is None:
+        raise errors.batch_not_found(batch_no)
+    rows = session.execute(
+        select(BatchLocation)
+        .where(BatchLocation.batch_no == batch_no)
+        .order_by(BatchLocation.location_code)
+    ).scalars().all()
+    return {
+        "batch_no": batch_no,
+        "unit": batch.unit,
+        "remaining_qty": float(batch.remaining_qty),
+        "locations": [
+            {"location_code": r.location_code, "quantity": float(r.qty)} for r in rows
+        ],
+    }
+
+
 def _acquire_qc_lock(session: Session) -> None:
     """污染标记/复核等 QC 写事务的串行化锁。
 
@@ -205,8 +364,13 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
     1. 投入明细编号不重复；
     2. 每个来源批次存在、单位一致、非已撤销产出、未隔离；
     3. 产出编号未被占用；
-    4. 每笔用量为正且不超过该批次余量；
+    4. 每笔用量为正：指定库位时该库位须存在且充足，未指定时全局余量充足
+       （库位层按库位编号顺序跨库位扣减）；
     5. 产出总量不超过投入总量。
+
+    库位层：每笔投料的实际扣减按库位写入 ProductionInputLocation，供生产
+    撤销时逐库位返还；产出批次进入默认库位。加锁顺序仍为“先按批次编号升序
+    锁批次，再按 (批次, 库位) 锁库位”，与调拨/分装共用同一全局顺序。
     """
     source_nos = [item.batch_no for item in data.inputs]
     if len(set(source_nos)) != len(source_nos):
@@ -241,12 +405,21 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
     if session.get(Batch, data.output_batch_no) is not None:
         raise errors.batch_exists(data.output_batch_no)
 
+    # 逐笔规划库位扣减（内部加库位行锁）。先统一规划、全部通过后才修改，
+    # 保证任一来源库位不足时整笔拒绝、不触碰任何库存。
+    plans: dict[int, dict[str, Decimal]] = {}
+    locked_locations: dict[int, dict[str, BatchLocation]] = {}
     for item in data.inputs:
         batch = sources[item.batch_no]
-        if item.quantity > batch.remaining_qty:
+        if item.location_code is None and item.quantity > batch.remaining_qty:
             raise errors.insufficient(
                 item.batch_no, item.quantity, batch.remaining_qty
             )
+        plan, loc_rows = _allocate_consumption(
+            session, item.batch_no, item.quantity, item.location_code
+        )
+        plans[id(item)] = plan
+        locked_locations[id(item)] = loc_rows
         total_input += item.quantity
 
     if data.output_quantity > total_input:
@@ -261,13 +434,9 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
             },
         )
 
-    output = Batch(
-        batch_no=data.output_batch_no,
-        unit=data.unit,
-        initial_qty=data.output_quantity,
-        remaining_qty=data.output_quantity,
+    output = _create_batch_with_default_location(
+        session, data.output_batch_no, data.unit, data.output_quantity
     )
-    session.add(output)
     try:
         session.flush()  # 让产出批次主键可用，并尽早暴露编号冲突
     except IntegrityError:
@@ -282,13 +451,24 @@ def submit_production(session: Session, data: ProductionIn) -> Production:
     for item in data.inputs:
         batch = sources[item.batch_no]
         batch.remaining_qty -= item.quantity
-        session.add(
-            ProductionInput(
-                production_id=production.id,
-                source_no=batch.batch_no,
-                qty=item.quantity,
-            )
+        plan = plans[id(item)]
+        _apply_location_plan(locked_locations[id(item)], plan)
+        production_input = ProductionInput(
+            production_id=production.id,
+            source_no=batch.batch_no,
+            qty=item.quantity,
+            location_code=item.location_code,
         )
+        session.add(production_input)
+        session.flush()  # 取得 production_input.id
+        for code in sorted(plan):
+            session.add(
+                ProductionInputLocation(
+                    production_input_id=production_input.id,
+                    location_code=code,
+                    qty=plan[code],
+                )
+            )
 
     session.flush()
     # 重新加载聚合，便于响应组装
@@ -314,13 +494,18 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
     2. 父批次存在（SOURCE_NOT_FOUND 404）、未隔离（BATCH_QUARANTINED 409）、
        非已撤销产出（BATCH_CANCELLED 409）；
     3. 每个新编号未被占用（BATCH_NO_REUSED 409，编号全局不得复用）；
-    4. 分装总量为正（入参已逐项保证 > 0）且不超过父批次余量
+    4. 分装总量为正（入参已逐项保证 > 0）：指定库位时该库位须存在且充足，
+       未指定时按库位编号顺序跨库位扣减、不得超过父批次全局余量
        （INSUFFICIENT_BALANCE 409）。
 
-    并发：与生产提交相同，按编号升序持锁（此处只锁父批次），子批次行由
-    唯一约束兜底并发抢号；SQLite 由 BEGIN IMMEDIATE 全库串行。分装 / 投料
-    并发不会超用；与污染标记/复核的关系同生产事务（经行锁与 QC 表锁互斥），
-    隔离沿分装边与投料边一并传播，不会漏隔离。
+    库位层：父批次按与投料一致的规则扣减库位余额；分装产生的子批次一律
+    进入默认库位（initial/当前余量均为分装量）。
+
+    并发：与生产提交相同，按编号升序持锁（此处只锁父批次），再锁其库位行，
+    子批次行由唯一约束兜底并发抢号；SQLite 由 BEGIN IMMEDIATE 全库串行。
+    分装 / 投料 / 调拨并发不会超用或使两层余额失配；与污染标记/复核的关系
+    同生产事务（经行锁与 QC 表锁互斥），隔离沿分装边与投料边一并传播，
+    不会漏隔离。
     """
     child_nos = [item.batch_no for item in data.splits]
     if len(set(child_nos)) != len(child_nos):
@@ -348,19 +533,20 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
     total = Decimal("0")
     for item in data.splits:
         total += item.quantity
-    if total > parent.remaining_qty:
+    if data.location_code is None and total > parent.remaining_qty:
         raise errors.insufficient(parent_no, total, parent.remaining_qty)
+
+    # 先规划库位扣减（内部加库位行锁），库位不足整笔拒绝、不动任何库存
+    plan, locked_locations = _allocate_consumption(
+        session, parent_no, total, data.location_code
+    )
 
     created: list[Batch] = []
     relations: list[BatchSplit] = []
     for item in data.splits:
-        child = Batch(
-            batch_no=item.batch_no,
-            unit=parent.unit,
-            initial_qty=item.quantity,
-            remaining_qty=item.quantity,
+        child = _create_batch_with_default_location(
+            session, item.batch_no, parent.unit, item.quantity
         )
-        session.add(child)
         try:
             session.flush()  # 尽早暴露并发下的编号冲突
         except IntegrityError:
@@ -370,8 +556,8 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
             BatchSplit(parent_no=parent_no, child_no=item.batch_no, qty=item.quantity)
         )
 
-    for item in data.splits:
-        parent.remaining_qty -= item.quantity
+    parent.remaining_qty -= total
+    _apply_location_plan(locked_locations, plan)
     session.add_all(relations)
     session.flush()
 
@@ -396,6 +582,99 @@ def split_batch(session: Session, parent_no: str, data: SplitIn) -> dict[str, An
                 "quantity": float(child.initial_qty),
             }
             for child in created
+        ],
+    }
+
+
+# ---------------------------------------------------------------- 库位调拨
+
+
+def transfer_stock(session: Session, data: TransferIn) -> dict[str, Any]:
+    """同一批次在两个库位之间调拨正数数量。
+
+    校验顺序（任一失败整笔拒绝、两库位余额均不变）：
+    1. 来源库位与目标库位不同（库位编号非空白由入参校验保证；
+       相同 -> TRANSFER_SAME_LOCATION 422）；
+    2. 调拨单号未被占用（TRANSFER_NO_REUSED 409，单号全局不得复用）；
+    3. 批次存在（SOURCE_NOT_FOUND 404）；
+    4. 来源库位存在（LOCATION_NOT_FOUND 404）且余额充足
+       （INSUFFICIENT_BALANCE 409，details 带库位编号）。
+
+    隔离批次（含疑似）与已撤销产出批次均**允许**调拨——隔离只禁止投料与
+    分装。调拨不改变批次全局余量，只在库位层把数量从来源移到目标；目标库位
+    首次使用时自动以零余额建行。
+
+    并发：先锁批次行（与投料/分装同一按编号升序的顺序），再按库位编号升序
+    锁来源/目标两行（目标行先 ON CONFLICT DO NOTHING 确保存在）。因此
+    调拨 / 投料 / 分装 / 撤销之间不会死锁，也不会超用或使两层余额失配；
+    SQLite 由 BEGIN IMMEDIATE 全库串行。
+    """
+    if data.source_location == data.target_location:
+        raise errors.transfer_same_location(data.source_location)
+
+    existing_transfer = session.execute(
+        select(StockTransfer.id).where(StockTransfer.transfer_no == data.transfer_no)
+    ).scalar_one_or_none()
+    if existing_transfer is not None:
+        raise errors.transfer_no_exists(data.transfer_no)
+
+    batch = _lock_batch(session, data.batch_no)
+    if batch is None:
+        raise errors.batch_not_found(data.batch_no)
+
+    # 先锁来源库位并完成“存在且充足”的全部校验，任何不符都在目标库位建行
+    # 之前拒绝（整单不留任何痕迹；HTTP 事务本也会回滚，这里双保险）。
+    source_rows = _lock_locations(session, data.batch_no, [data.source_location])
+    source = source_rows.get(data.source_location)
+    if source is None:
+        raise errors.location_not_found(data.batch_no, data.source_location)
+    if data.quantity > source.qty:
+        raise errors.insufficient(
+            data.batch_no,
+            data.quantity,
+            source.qty,
+            location_code=data.source_location,
+        )
+
+    # 目标库位可能首次使用：幂等确保零余额行存在后再加锁。同批次的写事务
+    # 都先持有批次行锁，故此处与其它事务不可能并发建行（ON CONFLICT 双保险）。
+    _ensure_location_rows(session, data.batch_no, [data.target_location])
+    target_rows = _lock_locations(session, data.batch_no, [data.target_location])
+    target = target_rows[data.target_location]
+
+    source.qty -= data.quantity
+    target.qty += data.quantity
+
+    transfer = StockTransfer(
+        transfer_no=data.transfer_no,
+        batch_no=data.batch_no,
+        source_location=data.source_location,
+        target_location=data.target_location,
+        qty=data.quantity,
+    )
+    session.add(transfer)
+    try:
+        session.flush()
+    except IntegrityError:
+        raise errors.transfer_no_exists(data.transfer_no) from None
+
+    final_locations = session.execute(
+        select(BatchLocation)
+        .where(BatchLocation.batch_no == data.batch_no)
+        .order_by(BatchLocation.location_code)
+    ).scalars().all()
+    return {
+        "transfer_no": data.transfer_no,
+        "batch_no": data.batch_no,
+        "source_location": data.source_location,
+        "target_location": data.target_location,
+        "quantity": float(data.quantity),
+        "source_balance": float(source.qty),
+        "target_balance": float(target.qty),
+        "remaining_qty": float(batch.remaining_qty),
+        "locations": [
+            {"location_code": r.location_code, "quantity": float(r.qty)}
+            for r in final_locations
         ],
     }
 
@@ -507,6 +786,35 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
     source_nos = sorted({pi.source_no for pi in production.inputs})
     locked_sources = _lock_batches_in_order(session, source_nos)
 
+    # 载入各投料行的逐库位消耗明细（撤销按原消耗库位返还）。
+    # 生产单内来源批次互不重复，但仍按 (来源编号, 库位) 顺序统一加锁，
+    # 与生产/分装/调拨保持同一全局加锁顺序。
+    input_ids = [pi.id for pi in sorted(production.inputs, key=lambda x: x.id)]
+    detail_rows = (
+        session.execute(
+            select(ProductionInputLocation).where(
+                ProductionInputLocation.production_input_id.in_(input_ids)
+            )
+        ).scalars().all()
+        if input_ids
+        else []
+    )
+    details_by_input: dict[int, list[ProductionInputLocation]] = {}
+    for row in detail_rows:
+        details_by_input.setdefault(row.production_input_id, []).append(row)
+
+    needed_locations: dict[str, set[str]] = {}
+    for pi in sorted(production.inputs, key=lambda x: x.id):
+        for d in details_by_input.get(pi.id, []):
+            needed_locations.setdefault(pi.source_no, set()).add(d.location_code)
+    locked_locations: dict[str, dict[str, BatchLocation]] = {}
+    for source_no in sorted(needed_locations):
+        codes = sorted(needed_locations[source_no])
+        # 防御：库位行必存在（生产时即扣减、启动回填覆盖历史单据）；
+        # 若因数据异常缺失，先补零行再锁定，返还逻辑保持不变。
+        _ensure_location_rows(session, source_no, codes)
+        locked_locations[source_no] = _lock_locations(session, source_no, codes)
+
     cancelled_at = datetime.now(timezone.utc)
     returned: list[dict[str, Any]] = []
     for pi in sorted(production.inputs, key=lambda x: x.id):
@@ -516,6 +824,10 @@ def cancel_production(session: Session, output_no: str, data: CancelIn) -> dict[
             raise errors.batch_not_found(pi.source_no)
         # 即使来源批次已隔离，也在本事务内返还其原投料量
         source.remaining_qty += pi.qty
+        details = details_by_input.get(pi.id, [])
+        for d in sorted(details, key=lambda r: r.location_code):
+            loc_row = locked_locations[pi.source_no][d.location_code]
+            loc_row.qty += d.qty
         returned.append(
             {"batch_no": pi.source_no, "returned_quantity": pi.qty}
         )

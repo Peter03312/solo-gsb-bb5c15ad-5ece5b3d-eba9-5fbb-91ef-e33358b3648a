@@ -11,6 +11,7 @@ from .deps import SessionDep
 from .errors import AppError
 from .models import Batch, Production
 from .schemas import (
+    BatchLocationsOut,
     BatchOut,
     CancellationOut,
     CancelIn,
@@ -25,6 +26,8 @@ from .schemas import (
     SplitIn,
     SplitOut,
     SuspectIn,
+    TransferIn,
+    TransferOut,
 )
 
 router = APIRouter()
@@ -206,6 +209,49 @@ def split_batch(
     )
     response.status_code = code
     return result
+
+
+@router.post("/transfers", response_model=TransferOut, status_code=status.HTTP_201_CREATED)
+def create_transfer(
+    body: TransferIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """库位调拨：凭唯一调拨单号把某批次的正数数量从来源库位移到目标库位。
+
+    返回调拨后两库位余额与该批次全部库位余额；库位为空/相同、批次不存在或
+    来源库位不足时整单拒绝、余额不变。隔离批次允许调拨。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_201_CREATED, service.transfer_stock(session, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.get("/batches/{batch_no}/locations", response_model=BatchLocationsOut)
+def get_batch_locations(batch_no: str, session: SessionDep) -> dict[str, Any]:
+    """查询批次逐库位余额（按库位编号排序）；各库位之和等于全局余量。"""
+    return service.get_batch_locations(session, batch_no)
 
 
 @router.post("/contamination", response_model=DescendantsOut, status_code=status.HTTP_200_OK)
